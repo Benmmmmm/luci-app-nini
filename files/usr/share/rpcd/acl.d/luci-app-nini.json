@@ -1,0 +1,30 @@
+{
+	"luci-app-nini": {
+		"description": "Grant access to NINI transparent proxy management",
+		"read": {
+			"ubus": {
+				"nini": [
+					"dashboard_status",
+					"proxy_state",
+					"ipv6_test",
+					"get_logs",
+					"get_config"
+				]
+			},
+			"uci": [ "nini" ]
+		},
+		"write": {
+			"ubus": {
+				"nini": [
+					"switch_node",
+					"auto_select",
+					"test_delay",
+					"update_rules",
+					"fetch_subscriptions",
+					"save_config"
+				]
+			},
+			"uci": [ "nini" ]
+		}
+	}
+}

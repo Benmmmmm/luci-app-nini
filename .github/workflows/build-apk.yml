@@ -1,0 +1,128 @@
+name: Build NINI APK
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  SDK_URL: https://downloads.immortalwrt.org/releases/25.12.0/targets/mediatek/filogic/immortalwrt-sdk-25.12.0-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+  SDK_FILENAME: immortalwrt-sdk-25.12.0-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+    - name: Checkout source
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential ccache ecj fastjar file g++ gawk \
+          gettext git java-propose-classpath libelf-dev libncurses5-dev \
+          libncursesw5-dev libssl-dev python3 python3-distutils python3-setuptools \
+          rsync subversion swig time xsltproc zlib1g-dev zstd \
+          libncurses-dev wget curl
+
+    - name: Download ImmortalWrt SDK
+      run: |
+        wget -q "$SDK_URL" -O "$SDK_FILENAME"
+        echo "SDK downloaded: $(ls -lh $SDK_FILENAME)"
+
+    - name: Extract SDK
+      run: |
+        tar --zstd -xf "$SDK_FILENAME"
+        mv immortalwrt-sdk-* sdk
+        ls -la sdk/
+
+    - name: Update and install feeds
+      run: |
+        cd sdk
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: Copy NINI package into SDK
+      run: |
+        cp -r "$GITHUB_WORKSPACE" sdk/package/luci-app-nini
+        ls -la sdk/package/luci-app-nini/
+
+    - name: Configure package selection
+      run: |
+        cd sdk
+        echo "CONFIG_PACKAGE_luci-app-nini=m" > .config
+        make defconfig
+        grep luci-app-nini .config || exit 1
+
+    - name: Compile luci-app-nini
+      run: |
+        cd sdk
+        make package/luci-app-nini/compile V=s -j$(nproc)
+
+    - name: Find built APK
+      run: |
+        cd sdk
+        find bin -name "luci-app-nini*.apk" -type f
+        find bin -name "luci-app-nini*.apk" -type f -exec ls -lh {} \;
+        find bin -name "luci-app-nini*.apk" -type f -exec cp {} "$GITHUB_WORKSPACE/" \;
+
+    - name: Inspect APK with apk adbdump
+      run: |
+        sudo apt-get install -y apk-tools 2>/dev/null || true
+        APK_FILE=$(ls -1 "$GITHUB_WORKSPACE"/luci-app-nini*.apk | head -1)
+        if command -v apk >/dev/null 2>&1; then
+          echo "=== apk adbdump ==="
+          apk adbdump "$APK_FILE" || true
+          echo "=== apk extract file list ==="
+          mkdir -p /tmp/apk-extract
+          cd /tmp/apk-extract
+          apk extract "$APK_FILE" || true
+          find . -type f | sort
+        else
+          echo "apk-tools not available, using tar to inspect"
+          mkdir -p /tmp/apk-inspect
+          cd /tmp/apk-inspect
+          tar xf "$APK_FILE"
+          find . -type f | sort
+        fi
+
+    - name: Upload APK artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: luci-app-nini-apk
+        path: |
+          luci-app-nini*.apk
+        if-no-files-found: error
+
+    - name: Upload source tarball
+      uses: actions/upload-artifact@v4
+      with:
+        name: luci-app-nini-source
+        path: |
+          !sdk/
+          !.git/
+          **
+        if-no-files-found: warn
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+    - name: Download artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: luci-app-nini-apk
+        path: ./
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          luci-app-nini*.apk
+        generate_release_notes: true

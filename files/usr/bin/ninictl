@@ -1,0 +1,1010 @@
+#!/bin/sh
+
+. /lib/functions.sh
+
+RUNDIR=/tmp/nini
+CACHEDIR=/etc/nini/cache
+DATADIR=/usr/share/nini
+CONFFILE=/etc/config/nini
+LOGFILE=$RUNDIR/nini.log
+MIHOMO_BIN=/usr/bin/mihomo
+MIHOMO_CFG=$RUNDIR/config.yaml
+MIHOMO_PID=$RUNDIR/mihomo.pid
+NFT_TABLE=inet\ nini
+
+API_PORT=9090
+MIXED_PORT=7890
+TPROXY_PORT=7892
+TPROXY_UDP_PORT=7893
+LAN_IFNAME=br-lan
+
+log() {
+	local msg="$1"
+	mkdir -p "$RUNDIR"
+	echo "$(date '+%Y-%m-%d %H:%M:%S') $msg" >> "$LOGFILE"
+	[ "$(uci -q get nini.main.debug_log)" = "1" ] && echo "$msg" >&2
+}
+
+uci_get() {
+	uci -q get "$1" 2>/dev/null || echo "$2"
+}
+
+load_config() {
+	config_load nini
+	API_PORT=$(uci_get nini.main.api_port 9090)
+	MIXED_PORT=$(uci_get nini.main.mixed_port 7890)
+	TPROXY_PORT=$(uci_get nini.main.tproxy_port 7892)
+	TPROXY_UDP_PORT=$(uci_get nini.main.tproxy_udp_port 7893)
+	LAN_IFNAME=$(uci_get nini.main.lan_ifname br-lan)
+}
+
+ensure_dirs() {
+	mkdir -p "$RUNDIR" "$CACHEDIR" "$DATADIR"
+}
+
+api_call() {
+	local path="$1"
+	curl -s --max-time 3 "http://127.0.0.1:${API_PORT}${path}" 2>/dev/null || echo '{}'
+}
+
+# ===== mihomo config generation =====
+
+gen_config() {
+	ensure_dirs
+	load_config
+
+	local mode=$(uci_get nini.main.mode cnip)
+	local ipv6=$(uci_get nini.main.ipv6 0)
+	local allow_ipv6_dns=$(uci_get nini.main.allow_ipv6_dns 0)
+	local allow_lan_api=$(uci_get nini.main.allow_lan_api 0)
+	local dns_hijack=$(uci_get nini.main.dns_hijack 1)
+	local exclude_router_dns=$(uci_get nini.main.exclude_router_dns 1)
+
+	cat > "$MIHOMO_CFG.tmp" <<EOF
+mixed-port: ${MIXED_PORT}
+external-controller: 127.0.0.1:${API_PORT}
+allow-lan: false
+ipv6: $( [ "$ipv6" = "1" ] && echo true || echo false )
+mode: rule
+log-level: $( [ "$(uci_get nini.main.debug_log 0)" = "1" ] && echo debug || echo info )
+find-process-mode: 'off'
+profile:
+  store-selected: true
+  store-fake-ip: false
+EOF
+
+	# TProxy inbound
+	cat >> "$MIHOMO_CFG.tmp" <<EOF
+
+tproxy-port: ${TPROXY_PORT}
+tun:
+  enable: false
+EOF
+
+	# DNS
+	cat >> "$MIHOMO_CFG.tmp" <<EOF
+
+dns:
+  enable: true
+  listen: 0.0.0.0:1053
+  ipv6: $( [ "$allow_ipv6_dns" = "1" ] && echo true || echo false )
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  fallback:
+    - https://1.1.1.1/dns-query
+    - https://8.8.8.8/dns-query
+  fallback-filter:
+    geoip: false
+EOF
+
+	# Proxies from cache
+	if [ -f "$CACHEDIR/proxies.yaml" ]; then
+		cat >> "$MIHOMO_CFG.tmp" <<EOF
+
+EOF
+		cat "$CACHEDIR/proxies.yaml" >> "$MIHOMO_CFG.tmp"
+	fi
+
+	# Proxy groups
+	cat >> "$MIHOMO_CFG.tmp" <<EOF
+
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - AUTO
+EOF
+	if [ -f "$CACHEDIR/proxy_names.txt" ]; then
+		while IFS= read -r name; do
+			[ -n "$name" ] && echo "      - \"$name\"" >> "$MIHOMO_CFG.tmp"
+		done < "$CACHEDIR/proxy_names.txt"
+	fi
+
+	cat >> "$MIHOMO_CFG.tmp" <<EOF
+  - name: AUTO
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    proxies:
+EOF
+	if [ -f "$CACHEDIR/proxy_names.txt" ]; then
+		while IFS= read -r name; do
+			[ -n "$name" ] && echo "      - \"$name\"" >> "$MIHOMO_CFG.tmp"
+		done < "$CACHEDIR/proxy_names.txt"
+	fi
+
+	cat >> "$MIHOMO_CFG.tmp" <<EOF
+  - name: FALLBACK
+    type: fallback
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    proxies:
+EOF
+	if [ -f "$CACHEDIR/proxy_names.txt" ]; then
+		while IFS= read -r name; do
+			[ -n "$name" ] && echo "      - \"$name\"" >> "$MIHOMO_CFG.tmp"
+		done < "$CACHEDIR/proxy_names.txt"
+	fi
+
+	# Rules
+	cat >> "$MIHOMO_CFG.tmp" <<EOF
+
+rules:
+EOF
+
+	if [ "$mode" = "global" ]; then
+		cat >> "$MIHOMO_CFG.tmp" <<EOF
+  - MATCH,PROXY
+EOF
+	else
+		# CNIP mode: use downloaded rules
+		if [ -f "$RUNDIR/johnshall_cnip.inline" ]; then
+			cat "$RUNDIR/johnshall_cnip.inline" >> "$MIHOMO_CFG.tmp"
+		else
+			# Fallback to minimal rules
+			cat >> "$MIHOMO_CFG.tmp" <<EOF
+  - IP-CIDR,127.0.0.0/8,DIRECT
+  - IP-CIDR,172.16.0.0/12,DIRECT
+  - IP-CIDR,192.168.0.0/16,DIRECT
+  - IP-CIDR,10.0.0.0/8,DIRECT
+  - IP-CIDR,100.64.0.0/10,DIRECT
+  - IP-CIDR,169.254.0.0/16,DIRECT
+  - IP-CIDR,224.0.0.0/4,DIRECT
+  - IP-CIDR,fe80::/10,DIRECT
+  - IP-CIDR,fc00::/7,DIRECT
+  - MATCH,PROXY
+EOF
+		fi
+	fi
+
+	mv "$MIHOMO_CFG.tmp" "$MIHOMO_CFG"
+	log "config candidate ready"
+}
+
+# ===== Rules download & processing =====
+
+update_rules() {
+	ensure_dirs
+	load_config
+	local url=$(uci_get nini.main.rule_url)
+	local name=$(uci_get nini.main.rule_name johnshall_cnip)
+	local cache_conf="$CACHEDIR/${name}.conf"
+	local cache_meta="$CACHEDIR/${name}.meta"
+	local inline_out="$RUNDIR/${name}.inline"
+
+	log "Updating rules from $url"
+	if curl -sL --max-time 30 "$url" -o "$cache_conf.tmp"; then
+		mv "$cache_conf.tmp" "$cache_conf"
+		echo "$(date +%s)" > "$cache_meta"
+		log "Rules downloaded successfully"
+	else
+		log "Rules download failed, using cache if available"
+		[ -f "$cache_conf" ] || return 1
+	fi
+
+	# Process rules into mihomo inline format
+	local skipped_geoip=0
+	local proxy_rules=0
+	local reject_rules=0
+	local direct_rules=0
+
+	> "$inline_out.tmp"
+
+	# Always add local/direct rules first
+	cat >> "$inline_out.tmp" <<EOF
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,100.64.0.0/10,DIRECT,no-resolve
+  - IP-CIDR,169.254.0.0/16,DIRECT,no-resolve
+  - IP-CIDR,224.0.0.0/4,DIRECT,no-resolve
+  - IP-CIDR,240.0.0.0/4,DIRECT,no-resolve
+  - IP-CIDR6,fe80::/10,DIRECT,no-resolve
+  - IP-CIDR6,fc00::/7,DIRECT,no-resolve
+  - IP-CIDR6,::1/128,DIRECT,no-resolve
+EOF
+
+	while IFS= read -r line; do
+		# Skip comments and empty lines
+		case "$line" in
+			''|\#*) continue ;;
+		esac
+
+		# Skip GEOIP rules
+		case "$line" in
+			*GEOIP*)
+				skipped_geoip=$((skipped_geoip + 1))
+				continue
+				;;
+		esac
+
+		# Normalize and parse Shadowrocket format
+		local rule_type=$(echo "$line" | awk -F',' '{print $1}' | tr '[:lower:]' '[:upper:]')
+		local rule_val=$(echo "$line" | awk -F',' '{print $2}')
+		local rule_action=$(echo "$line" | awk -F',' '{print $3}' | tr '[:lower:]' '[:upper:]')
+
+		[ -z "$rule_type" ] && continue
+		[ -z "$rule_val" ] && continue
+
+		# Normalize action
+		case "$rule_action" in
+			PROXY|代理) rule_action=PROXY ;;
+			DIRECT|直连) rule_action=DIRECT ;;
+			REJECT|拒绝) rule_action=REJECT ;;
+			*) rule_action=PROXY ;;
+		esac
+
+		# Convert rule type
+		case "$rule_type" in
+			DOMAIN)
+				echo "  - DOMAIN,${rule_val},${rule_action}" >> "$inline_out.tmp"
+				;;
+			DOMAIN-SUFFIX)
+				echo "  - DOMAIN-SUFFIX,${rule_val},${rule_action}" >> "$inline_out.tmp"
+				;;
+			DOMAIN-KEYWORD)
+				echo "  - DOMAIN-KEYWORD,${rule_val},${rule_action}" >> "$inline_out.tmp"
+				;;
+			IP-CIDR|IP-CIDR6)
+				echo "  - ${rule_type},${rule_val},${rule_action},no-resolve" >> "$inline_out.tmp"
+				;;
+			SRC-IP-CIDR)
+				echo "  - SRC-IP-CIDR,${rule_val},${rule_action}" >> "$inline_out.tmp"
+				;;
+			DST-PORT|SRC-PORT)
+				echo "  - ${rule_type},${rule_val},${rule_action}" >> "$inline_out.tmp"
+				;;
+			PROCESS-NAME)
+				echo "  - PROCESS-NAME,${rule_val},${rule_action}" >> "$inline_out.tmp"
+				;;
+			MATCH)
+				echo "  - MATCH,${rule_action}" >> "$inline_out.tmp"
+				;;
+			*)
+				continue
+				;;
+		esac
+
+		case "$rule_action" in
+			PROXY) proxy_rules=$((proxy_rules + 1)) ;;
+			REJECT) reject_rules=$((reject_rules + 1)) ;;
+			DIRECT) direct_rules=$((direct_rules + 1)) ;;
+		esac
+	done < "$cache_conf"
+
+	# Ensure final MATCH rule
+	grep -q "^  - MATCH," "$inline_out.tmp" 2>/dev/null || echo "  - MATCH,PROXY" >> "$inline_out.tmp"
+
+	mv "$inline_out.tmp" "$inline_out"
+
+	# Save stats
+	cat > "$RUNDIR/rule_stats.json" <<EOF
+{
+  "skipped_geoip": ${skipped_geoip},
+  "proxy_rules": ${proxy_rules},
+  "reject_rules": ${reject_rules},
+  "direct_rules": ${direct_rules},
+  "total_rules": $((proxy_rules + reject_rules + direct_rules)),
+  "updated": $(cat "$cache_meta" 2>/dev/null || echo 0),
+  "cache_hit": 0
+}
+EOF
+
+	log "Rules processed: PROXY=${proxy_rules} REJECT=${reject_rules} DIRECT=${direct_rules} skipped_geoip=${skipped_geoip}"
+	return 0
+}
+
+# ===== Subscription fetch =====
+
+fetch_subscriptions() {
+	ensure_dirs
+	load_config
+
+	local idx=0
+	local all_proxies=""
+	local proxy_names=""
+	local filtered_include=0
+	local filtered_expire=0
+	local filtered_local=0
+
+	config_foreach __fetch_sub subscription
+
+	# Save proxies
+	echo "$all_proxies" > "$CACHEDIR/proxies.yaml"
+	echo "$proxy_names" > "$CACHEDIR/proxy_names.txt"
+
+	cat > "$RUNDIR/sub_stats.json" <<EOF
+{
+  "total": $(echo "$proxy_names" | grep -c '^' || echo 0),
+  "filtered_include": ${filtered_include},
+  "filtered_expire": ${filtered_expire},
+  "filtered_local": ${filtered_local}
+}
+EOF
+
+	log "Subscription fetch complete"
+}
+
+__fetch_sub() {
+	local cfg="$1"
+	local name url enabled include exclude
+	config_get name "$cfg" name ""
+	config_get url "$cfg" url ""
+	config_get enabled "$cfg" enabled 0
+	config_get include "$cfg" include ""
+	config_get exclude "$cfg" exclude ""
+
+	[ "$enabled" = "1" ] || return 0
+	[ -z "$url" ] && return 0
+
+	log "Fetching subscription: $name"
+	local tmpfile="$RUNDIR/sub_${cfg}.tmp"
+	if ! curl -sL --max-time 30 "$url" -o "$tmpfile"; then
+		log "local proxy failed, used direct"
+		if ! curl -sL --max-time 30 --interface "$LAN_IFNAME" "$url" -o "$tmpfile" 2>/dev/null; then
+			log "Subscription fetch failed: $name"
+			return 0
+		fi
+	fi
+
+	# Try decode base64
+	local data
+	data=$(base64 -d "$tmpfile" 2>/dev/null || cat "$tmpfile")
+
+	# Parse proxies from data
+	local proxy_data=""
+	proxy_data=$(echo "$data" | awk '/^proxies:/{flag=1} flag{print} /^$/{if(flag)exit}' 2>/dev/null || true)
+
+	if [ -z "$proxy_data" ]; then
+		# Try YAML format
+		proxy_data=$(echo "$data" | sed -n '/proxies:/,/^[^ ]/p' 2>/dev/null || true)
+	fi
+
+	# Process each proxy
+	local pcount=0
+	while IFS= read -r line; do
+		case "$line" in
+			"  -"*)
+				pcount=$((pcount + 1))
+				;;
+		esac
+	done <<EOF
+$proxy_data
+EOF
+
+	# Simple filtering: just dump proxy section for now
+	# Real filtering would parse each proxy node
+	if [ -n "$proxy_data" ]; then
+		all_proxies="${all_proxies}\n${proxy_data}"
+	fi
+
+	rm -f "$tmpfile"
+}
+
+# ===== nftables / TProxy =====
+
+setup_firewall() {
+	ensure_dirs
+	load_config
+
+	local mode=$(uci_get nini.main.mode cnip)
+	local ipv6=$(uci_get nini.main.ipv6 0)
+	local dns_hijack=$(uci_get nini.main.dns_hijack 1)
+	local exclude_router_dns=$(uci_get nini.main.exclude_router_dns 1)
+
+	# Clean old table
+	nft delete table inet nini 2>/dev/null || true
+
+	# Create nft table
+	nft -f - <<EOF
+table inet nini {
+	set lan_ips {
+		type ipv4_addr
+		flags interval
+		elements = { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 224.0.0.0/4 }
+	}
+	set lan_ips6 {
+		type ipv6_addr
+		flags interval
+		elements = { ::1/128, fe80::/10, fc00::/7 }
+	}
+
+	chain prerouting {
+		type filter hook prerouting priority mangle; policy accept;
+		# Skip local
+		meta mark 0x000000ff return
+		# Skip LAN to LAN
+		ip daddr @lan_ips return
+		ip6 daddr @lan_ips6 $( [ "$ipv6" = "1" ] && echo "" || echo "return" )
+		# DNS hijack
+		$( [ "$dns_hijack" = "1" ] && echo "udp dport 53 redirect to :1053" || echo "# DNS hijack disabled" )
+		$( [ "$dns_hijack" = "1" ] && echo "tcp dport 53 redirect to :1053" || echo "# DNS hijack disabled" )
+		# TProxy TCP
+		ip protocol tcp tproxy to :${TPROXY_PORT} meta mark set 0x00000001
+		$( [ "$ipv6" = "1" ] && echo "ip6 nexthdr tcp tproxy to :${TPROXY_PORT} meta mark set 0x00000001" || echo "# IPv6 TProxy disabled" )
+		# TProxy UDP
+		ip protocol udp tproxy to :${TPROXY_UDP_PORT} meta mark set 0x00000001
+		$( [ "$ipv6" = "1" ] && echo "ip6 nexthdr udp tproxy to :${TPROXY_UDP_PORT} meta mark set 0x00000001" || echo "# IPv6 TProxy disabled" )
+	}
+
+	chain output {
+		type route hook output priority mangle; policy accept;
+		# Skip mihomo itself
+		meta skuid $(id -u mihomo 2>/dev/null || echo 0) return
+		# Skip local
+		ip daddr @lan_ips return
+		ip6 daddr @lan_ips6 $( [ "$ipv6" = "1" ] && echo "" || echo "return" )
+		# Mark for routing
+		ip protocol tcp meta mark set 0x00000001
+		$( [ "$ipv6" = "1" ] && echo "ip6 nexthdr tcp meta mark set 0x00000001" || echo "# IPv6 mark disabled" )
+		ip protocol udp meta mark set 0x00000001
+		$( [ "$ipv6" = "1" ] && echo "ip6 nexthdr udp meta mark set 0x00000001" || echo "# IPv6 mark disabled" )
+	}
+}
+EOF
+
+	# Setup routing rules for fwmark
+	ip rule add fwmark 0x1 lookup 100 2>/dev/null || true
+	ip route add local default dev lo table 100 2>/dev/null || true
+
+	if [ "$ipv6" = "1" ]; then
+		ip -6 rule add fwmark 0x1 lookup 100 2>/dev/null || true
+		ip -6 route add local default dev lo table 100 2>/dev/null || true
+	fi
+
+	# DNS hijack via firewall4 redirect
+	if [ "$dns_hijack" = "1" ]; then
+		# Redirect LAN DNS to mihomo DNS
+		nft add rule inet nini prerouting udp dport 53 redirect to :1053 2>/dev/null || true
+		nft add rule inet nini prerouting tcp dport 53 redirect to :1053 2>/dev/null || true
+	fi
+
+	log "Firewall configured"
+}
+
+clear_firewall() {
+	nft delete table inet nini 2>/dev/null || true
+	ip rule del fwmark 0x1 lookup 100 2>/dev/null || true
+	ip route del local default dev lo table 100 2>/dev/null || true
+	ip -6 rule del fwmark 0x1 lookup 100 2>/dev/null || true
+	ip -6 route del local default dev lo table 100 2>/dev/null || true
+	log "Firewall cleared"
+}
+
+# ===== mihomo control =====
+
+start_mihomo() {
+	ensure_dirs
+	load_config
+	[ -f "$MIHOMO_CFG" ] || gen_config
+
+	if [ -f "$MIHOMO_PID" ] && kill -0 "$(cat "$MIHOMO_PID")" 2>/dev/null; then
+		log "mihomo already running"
+		return 0
+	fi
+
+	# Run mihomo
+	if [ -x "$MIHOMO_BIN" ]; then
+		nohup "$MIHOMO_BIN" -f "$MIHOMO_CFG" >> "$LOGFILE" 2>&1 &
+		echo $! > "$MIHOMO_PID"
+		log "mihomo started (pid=$!)"
+	else
+		log "mihomo binary not found at $MIHOMO_BIN"
+		return 1
+	fi
+
+	# Wait for API
+	local wait=0
+	while [ $wait -lt 15 ]; do
+		if curl -s --max-time 2 "http://127.0.0.1:${API_PORT}/version" > /dev/null 2>&1; then
+			log "mihomo API ready"
+			return 0
+		fi
+		sleep 1
+		wait=$((wait + 1))
+	done
+	log "mihomo API timeout"
+	return 1
+}
+
+stop_mihomo() {
+	if [ -f "$MIHOMO_PID" ]; then
+		local pid=$(cat "$MIHOMO_PID")
+		kill "$pid" 2>/dev/null || true
+		sleep 1
+		kill -9 "$pid" 2>/dev/null || true
+		rm -f "$MIHOMO_PID"
+		log "mihomo stopped"
+	fi
+	return 0
+}
+
+# ===== Node operations =====
+
+switch_node() {
+	local node="$1"
+	load_config
+	if [ -z "$node" ]; then
+		log "switch_node: empty node"
+		return 1
+	fi
+	local payload="{\"name\":\"PROXY\",\"now\":\"${node}\"}"
+	local resp
+	resp=$(curl -s --max-time 5 -X PUT "http://127.0.0.1:${API_PORT}/proxies/PROXY" \
+		-H "Content-Type: application/json" \
+		-d "$payload" 2>/dev/null || echo '{"error":"API unavailable"}')
+	log "Switched to node: $node"
+	echo "$resp"
+}
+
+auto_select() {
+	load_config
+	# Switch PROXY group to AUTO
+	switch_node "AUTO"
+	log "AUTO select activated"
+}
+
+test_delay() {
+	load_config
+	local results="{}"
+	local names=""
+	if [ -f "$CACHEDIR/proxy_names.txt" ]; then
+		names=$(cat "$CACHEDIR/proxy_names.txt")
+	fi
+
+	local tmpout="$RUNDIR/delay_test.json"
+	echo "{" > "$tmpout"
+	local first=1
+
+	while IFS= read -r name; do
+		[ -z "$name" ] && continue
+		[ "$name" = "AUTO" ] && continue
+
+		local delay
+		delay=$(curl -s --max-time 10 "http://127.0.0.1:${API_PORT}/proxies/${name}/delay?url=http://www.gstatic.com/generate_204&timeout=5000" 2>/dev/null | awk -F'delay":' '{print $2}' | awk -F'}' '{print $1}' || echo "")
+
+		[ "$first" = "1" ] || echo "," >> "$tmpout"
+		first=0
+
+		if [ -z "$delay" ]; then
+			echo "  \"$name\": null" >> "$tmpout"
+		elif [ "$delay" = "0" ]; then
+			echo "  \"$name\": 0" >> "$tmpout"
+		else
+			echo "  \"$name\": $delay" >> "$tmpout"
+		fi
+	done <<EOF
+$names
+EOF
+
+	echo "}" >> "$tmpout"
+	log "Delay test complete"
+	cat "$tmpout"
+}
+
+# ===== Status =====
+
+dashboard_status() {
+	load_config
+	ensure_dirs
+
+	local enabled=$(uci_get nini.main.enabled 0)
+	local mode=$(uci_get nini.main.mode cnip)
+	local ipv6=$(uci_get nini.main.ipv6 0)
+	local allow_ipv6_dns=$(uci_get nini.main.allow_ipv6_dns 0)
+	local debug_log=$(uci_get nini.main.debug_log 0)
+
+	local service_running="false"
+	local api_ok="false"
+	local firewall="false"
+	local tproxy_ok="false"
+	local nft_table="false"
+	local proxy_count=0
+	local current_node=""
+	local auto_node=""
+	local fallback_node=""
+	local ipv6_ok="false"
+	local ipv6_gw="未通过"
+	local ipv6_pub="未通过"
+	local ipv6_node_count=0
+	local ipv6_node_total=0
+
+	# Check service
+	if [ -f "$MIHOMO_PID" ] && kill -0 "$(cat "$MIHOMO_PID")" 2>/dev/null; then
+		service_running="true"
+	fi
+
+	# Check API
+	if curl -s --max-time 2 "http://127.0.0.1:${API_PORT}/version" > /dev/null 2>&1; then
+		api_ok="true"
+	fi
+
+	# Check firewall
+	if nft list table inet nini > /dev/null 2>&1; then
+		firewall="true"
+		nft_table="true"
+	fi
+
+	# Check TProxy ports
+	if ss -lntup 2>/dev/null | grep -q ":${TPROXY_PORT}"; then
+		tproxy_ok="true"
+	fi
+
+	# Get proxy info from API
+	if [ "$api_ok" = "true" ]; then
+		local proxy_info
+		proxy_info=$(curl -s --max-time 3 "http://127.0.0.1:${API_PORT}/proxies/PROXY" 2>/dev/null || echo '{}')
+		current_node=$(echo "$proxy_info" | awk -F'"now":"' '{print $2}' | awk -F'"' '{print $1}')
+
+		local auto_info
+		auto_info=$(curl -s --max-time 3 "http://127.0.0.1:${API_PORT}/proxies/AUTO" 2>/dev/null || echo '{}')
+		auto_node=$(echo "$auto_info" | awk -F'"now":"' '{print $2}' | awk -F'"' '{print $1}')
+
+		local fb_info
+		fb_info=$(curl -s --max-time 3 "http://127.0.0.1:${API_PORT}/proxies/FALLBACK" 2>/dev/null || echo '{}')
+		fallback_node=$(echo "$fb_info" | awk -F'"now":"' '{print $2}' | awk -F'"' '{print $1}')
+
+		# Count proxies
+		local all_proxies
+		all_proxies=$(curl -s --max-time 3 "http://127.0.0.1:${API_PORT}/proxies" 2>/dev/null || echo '{}')
+		proxy_count=$(echo "$all_proxies" | grep -o '"name"' | wc -l)
+		proxy_count=$((proxy_count - 3))  # Exclude PROXY, AUTO, FALLBACK
+		[ "$proxy_count" -lt 0 ] && proxy_count=0
+	fi
+
+	# IPv6 checks
+	if [ "$ipv6" = "1" ]; then
+		# Gateway IPv6
+		if ping6 -c 1 -W 2 fe80::1%br-lan > /dev/null 2>&1 || ping6 -c 1 -W 2 2001:4860:4860::8888 > /dev/null 2>&1; then
+			ipv6_gw="通过"
+		fi
+		# Public IPv6
+		if curl -s --max-time 5 -6 https://ipv6.icanhazip.com > /dev/null 2>&1; then
+			ipv6_pub="通过"
+			ipv6_ok="true"
+		fi
+	fi
+
+	# Rule stats
+	local rule_status="未生效"
+	local rule_updated="未完成"
+	local proxy_rules=0
+	local reject_rules=0
+	local skipped_geoip=0
+	local rule_update_time=""
+
+	if [ -f "$RUNDIR/rule_stats.json" ]; then
+		rule_status="已生效"
+		proxy_rules=$(awk -F'"proxy_rules":' '{print $2}' "$RUNDIR/rule_stats.json" | awk -F',' '{print $1}' | tr -d ' ' || echo 0)
+		reject_rules=$(awk -F'"reject_rules":' '{print $2}' "$RUNDIR/rule_stats.json" | awk -F',' '{print $1}' | tr -d ' ' || echo 0)
+		skipped_geoip=$(awk -F'"skipped_geoip":' '{print $2}' "$RUNDIR/rule_stats.json" | awk -F',' '{print $1}' | tr -d ' ' || echo 0)
+		local updated_ts
+		updated_ts=$(awk -F'"updated":' '{print $2}' "$RUNDIR/rule_stats.json" | awk -F',' '{print $1}' | tr -d ' ' || echo 0)
+		if [ "$updated_ts" != "0" ] && [ -n "$updated_ts" ]; then
+			rule_update_time=$(date -d "@${updated_ts}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
+			local today=$(date '+%Y-%m-%d')
+			case "$rule_update_time" in
+				"${today}"*) rule_updated="已完成" ;;
+				*) rule_updated="使用缓存" ;;
+			esac
+		fi
+	fi
+
+	# Sub stats
+	local sub_total=0
+	if [ -f "$RUNDIR/sub_stats.json" ]; then
+		sub_total=$(awk -F'"total":' '{print $2}' "$RUNDIR/sub_stats.json" | awk -F',' '{print $1}' | tr -d ' ' || echo 0)
+	fi
+
+	# DNS status
+	local dns_hijack=$(uci_get nini.main.dns_hijack 1)
+	local dns_mode="不接管 LAN DNS"
+	[ "$dns_hijack" = "1" ] && dns_mode="直接劫持 LAN DNS"
+
+	cat <<EOF
+{
+  "enabled": $enabled,
+  "service_running": $service_running,
+  "state": "$( [ "$service_running" = "true" ] && echo "transparent proxy active" || echo "stopped" )",
+  "firewall": $firewall,
+  "tproxy_ok": $tproxy_ok,
+  "nft_table": $nft_table,
+  "mode": "$mode",
+  "mode_text": "$( [ "$mode" = "cnip" ] && echo "国内外分流（推荐）" || echo "全局代理" )",
+  "api_ok": $api_ok,
+  "proxy_count": $proxy_count,
+  "current_node": "$current_node",
+  "auto_node": "$auto_node",
+  "fallback_node": "$fallback_node",
+  "ipv6_ok": $ipv6_ok,
+  "ipv6_gw": "$ipv6_gw",
+  "ipv6_pub": "$ipv6_pub",
+  "ipv6_node_count": $ipv6_node_count,
+  "ipv6_node_total": $ipv6_node_total,
+  "mihomo_ipv6": $( [ "$ipv6" = "1" ] && echo "true" || echo "false" ),
+  "rule_status": "$rule_status",
+  "rule_updated": "$rule_updated",
+  "rule_source": "Johnshall 国内外分流源（johnshall.github）",
+  "proxy_rules": $proxy_rules,
+  "reject_rules": $reject_rules,
+  "skipped_geoip": $skipped_geoip,
+  "fallback": "MATCH,PROXY",
+  "lan_ifname": "$LAN_IFNAME",
+  "dns_mode": "$dns_mode",
+  "dns_hijack": $( [ "$dns_hijack" = "1" ] && echo "true" || echo "false" ),
+  "exclude_router_dns": $( [ "$(uci_get nini.main.exclude_router_dns 1)" = "1" ] && echo "true" || echo "false" ),
+  "allow_ipv6_dns": $( [ "$allow_ipv6_dns" = "1" ] && echo "true" || echo "false" ),
+  "allow_lan_api": $( [ "$(uci_get nini.main.allow_lan_api 0)" = "1" ] && echo "true" || echo "false" ),
+  "debug_log": $( [ "$debug_log" = "1" ] && echo "true" || echo "false" ),
+  "mixed_port": $MIXED_PORT,
+  "tproxy_port": $TPROXY_PORT,
+  "tproxy_udp_port": $TPROXY_UDP_PORT,
+  "api_port": $API_PORT,
+  "sub_total": $sub_total,
+  "rule_update_time": "$rule_update_time",
+  "update_time": "$(date '+%Y-%m-%d %H:%M:%S')"
+}
+EOF
+}
+
+proxy_state() {
+	load_config
+	local names=""
+	if [ -f "$CACHEDIR/proxy_names.txt" ]; then
+		names=$(cat "$CACHEDIR/proxy_names.txt")
+	fi
+
+	local tmpout="$RUNDIR/proxy_state.json"
+	echo "[" > "$tmpout"
+	local first=1
+
+	while IFS= read -r name; do
+		[ -z "$name" ] && continue
+		[ "$name" = "AUTO" ] && continue
+
+		local type=""
+		local server=""
+		local delay=""
+		local status="可用，未返回延迟"
+
+		if [ -f "$RUNDIR/delay_test.json" ]; then
+			delay=$(awk -F"\"${name}\":" '{print $2}' "$RUNDIR/delay_test.json" | awk -F',' '{print $1}' | awk -F'}' '{print $1}' | tr -d ' ' || echo "")
+		fi
+
+		if [ -z "$delay" ]; then
+			status="可用，未返回延迟"
+		elif [ "$delay" = "null" ]; then
+			status="超时"
+		elif [ "$delay" = "0" ]; then
+			status="延迟测试失败"
+		else
+			status="${delay} ms"
+		fi
+
+		[ "$first" = "1" ] || echo "," >> "$tmpout"
+		first=0
+
+		cat >> "$tmpout" <<NODE
+  {
+    "name": "$name",
+    "type": "$type",
+    "server": "$server",
+    "delay": "$status",
+    "delay_raw": $( [ -z "$delay" ] || [ "$delay" = "null" ] && echo "null" || echo "$delay" )
+  }
+NODE
+	done <<EOF
+$names
+EOF
+
+	echo "" >> "$tmpout"
+	echo "]" >> "$tmpout"
+	cat "$tmpout"
+}
+
+ipv6_test() {
+	load_config
+	local ipv6=$(uci_get nini.main.ipv6 0)
+	local result="{\"ok\": false, \"gw\": \"未通过\", \"pub\": \"未通过\"}"
+
+	if [ "$ipv6" = "1" ]; then
+		local gw="未通过"
+		local pub="未通过"
+		local ok="false"
+
+		if ping6 -c 1 -W 2 2001:4860:4860::8888 > /dev/null 2>&1; then
+			gw="通过"
+		fi
+		if curl -s --max-time 5 -6 https://ipv6.icanhazip.com > /dev/null 2>&1; then
+			pub="通过"
+			ok="true"
+		fi
+		result="{\"ok\": $ok, \"gw\": \"$gw\", \"pub\": \"$pub\"}"
+	fi
+	echo "$result"
+}
+
+# ===== Logs =====
+get_logs() {
+	local limit="${1:-200}"
+	if [ -f "$LOGFILE" ]; then
+		tail -n "$limit" "$LOGFILE" | while IFS= read -r line; do
+			# Translate known messages
+			case "$line" in
+				*"config candidate ready"*)
+					echo "$line" | sed 's/config candidate ready/配置已生成/'
+					;;
+				*"delay test failed"*)
+					echo "$line" | sed 's/delay test failed/延迟测试失败/'
+					;;
+				*"include-miss"*)
+					echo "$line" | sed 's/include-miss/未命中保留关键词/'
+					;;
+				*"invalid-expire"*)
+					echo "$line" | sed 's/invalid-expire/已过滤机场信息节点/'
+					;;
+				*"local proxy failed, used direct"*)
+					echo "$line" | sed 's/local proxy failed, used direct/本机代理拉取失败，已改用直连/'
+					;;
+				*"local_proxy"*)
+					echo "$line" | sed 's/local_proxy/本机代理/'
+					;;
+				*)
+					local debug_log=$(uci_get nini.main.debug_log 0)
+					if [ "$debug_log" = "1" ]; then
+						echo "$line"
+					else
+						# Filter out low-level noise
+						case "$line" in
+							*"curl"*|*"lua"*|*"mihomo"*|*"GET"*|*"POST"*|*"PUT"*)
+								;;
+							*)
+								echo "$line"
+								;;
+							esac
+					fi
+					;;
+			esac
+		done
+	fi
+}
+
+# ===== Watcher =====
+watcher() {
+	# This runs periodically via cron or delayed start
+	# Auto-fetch subscriptions if enabled and no proxies cached
+	if [ ! -f "$CACHEDIR/proxy_names.txt" ] || [ ! -s "$CACHEDIR/proxy_names.txt" ]; then
+		log "Watcher: no proxies cached, fetching subscriptions"
+		fetch_subscriptions
+		gen_config
+		# Safe reload
+		if [ -f "$MIHOMO_PID" ] && kill -0 "$(cat "$MIHOMO_PID")" 2>/dev/null; then
+			curl -s --max-time 5 -X PUT "http://127.0.0.1:${API_PORT}/configs?force=true" \
+				-H "Content-Type: application/json" \
+				-d "{\"path\":\"${MIHOMO_CFG}\"}" 2>/dev/null || true
+		fi
+	fi
+}
+
+# ===== Daemon mode =====
+daemon() {
+	ensure_dirs
+	load_config
+
+	# Clean stale locks
+	rm -f "$RUNDIR/stopping" "$RUNDIR/start.lock"
+
+	# Update rules if needed
+	if [ ! -f "$RUNDIR/johnshall_cnip.inline" ]; then
+		update_rules || true
+	fi
+
+	# Generate config
+	gen_config
+
+	# Setup firewall
+	setup_firewall
+
+	# Start mihomo
+	start_mihomo
+
+	# Keep alive
+	while [ ! -f "$RUNDIR/stopping" ]; do
+		sleep 5
+		# Health check
+		if [ -f "$MIHOMO_PID" ]; then
+			if ! kill -0 "$(cat "$MIHOMO_PID")" 2>/dev/null; then
+				log "mihomo died, restarting"
+				start_mihomo
+			fi
+		fi
+	done
+
+	log "Daemon stopping"
+	stop_mihomo
+	clear_firewall
+}
+
+# ===== CLI entrypoint =====
+case "$1" in
+	start)
+		gen_config
+		setup_firewall
+		start_mihomo
+		;;
+	stop)
+		stop_mihomo
+		clear_firewall
+		;;
+	restart)
+		stop_mihomo
+		clear_firewall
+		gen_config
+		setup_firewall
+		start_mihomo
+		;;
+	gen_config)
+		gen_config
+		;;
+	update_rules)
+		update_rules
+		;;
+	fetch_subscriptions)
+		fetch_subscriptions
+		;;
+	switch_node)
+		switch_node "$2"
+		;;
+	auto_select)
+		auto_select
+		;;
+	test_delay)
+		test_delay
+		;;
+	dashboard_status)
+		dashboard_status
+		;;
+	proxy_state)
+		proxy_state
+		;;
+	ipv6_test)
+		ipv6_test
+		;;
+	get_logs)
+		get_logs "$2"
+		;;
+	watcher)
+		watcher
+		;;
+	daemon)
+		daemon
+		;;
+	*)
+		echo "Usage: ninictl {start|stop|restart|gen_config|update_rules|fetch_subscriptions|switch_node <node>|auto_select|test_delay|dashboard_status|proxy_state|ipv6_test|get_logs [limit]|watcher|daemon}"
+		exit 1
+		;;
+esac

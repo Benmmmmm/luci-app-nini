@@ -1,0 +1,58 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+STOP=01
+USE_PROCD=1
+
+PROG=/usr/bin/ninictl
+RUNDIR=/tmp/nini
+LOGFILE=/tmp/nini/nini.log
+
+start_service() {
+	config_load nini
+	config_get enabled main enabled 0
+	[ "$enabled" = "1" ] || return 0
+
+	# Clean stale locks
+	rm -f "$RUNDIR/stopping" "$RUNDIR/start.lock"
+
+	# Ensure rundir
+	mkdir -p "$RUNDIR"
+
+	procd_open_instance nini
+	procd_set_param command "$PROG" daemon
+	procd_set_param respawn
+	procd_set_param stderr 1
+	procd_set_param stdout 1
+	procd_close_instance
+
+	# Mark start lock briefly
+	touch "$RUNDIR/start.lock"
+
+	# Delayed watcher to avoid racing mihomo startup
+	(
+		sleep 90
+		[ -f "$RUNDIR/stopping" ] && exit 0
+		/usr/bin/ninictl watcher
+	) &
+}
+
+stop_service() {
+	mkdir -p "$RUNDIR"
+	touch "$RUNDIR/stopping"
+	rm -f "$RUNDIR/start.lock"
+	/usr/bin/ninictl stop 2>/dev/null || true
+}
+
+service_triggers() {
+	procd_add_reload_trigger nini
+}
+
+reload_service() {
+	stop
+	start
+}
+
+shutdown() {
+	stop
+}

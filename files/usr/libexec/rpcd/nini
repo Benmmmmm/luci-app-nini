@@ -1,0 +1,116 @@
+#!/bin/sh
+
+. /usr/share/libubox/jshn.sh
+
+log() {
+	logger -t rpcd-nini "$1"
+}
+
+case "$1" in
+	list)
+		cat <<EOF
+{
+	"dashboard_status": {},
+	"proxy_state": {},
+	"switch_node": { "node": "str" },
+	"auto_select": {},
+	"test_delay": {},
+	"update_rules": {},
+	"fetch_subscriptions": {},
+	"ipv6_test": {},
+	"get_logs": { "limit": "int" },
+	"save_config": { "section": "str", "values": "str" },
+	"get_config": { "section": "str" }
+}
+EOF
+		;;
+	call)
+		case "$2" in
+			dashboard_status)
+				/usr/bin/ninictl dashboard_status
+				;;
+			proxy_state)
+				/usr/bin/ninictl proxy_state
+				;;
+			switch_node)
+				read -r input
+				local node=$(echo "$input" | jsonfilter -e '@.node' 2>/dev/null || echo "")
+				result=$(/usr/bin/ninictl switch_node "$node" 2>/dev/null || echo '{"error":"failed"}')
+				echo '{"result": true}'
+				;;
+			auto_select)
+				/usr/bin/ninictl auto_select
+				echo '{"result": true}'
+				;;
+			test_delay)
+				# Run in background to avoid timeout
+				(/usr/bin/ninictl test_delay > /tmp/nini/delay_test.json 2>/dev/null) &
+				echo '{"result": true, "message": "延迟测试已启动"}'
+				;;
+			update_rules)
+				result=$(/usr/bin/ninictl update_rules 2>/dev/null || echo '{"error":"failed"}')
+				echo '{"result": true, "message": "规则更新完成"}'
+				;;
+			fetch_subscriptions)
+				result=$(/usr/bin/ninictl fetch_subscriptions 2>/dev/null || echo '{"error":"failed"}')
+				echo '{"result": true, "message": "订阅拉取完成"}'
+				;;
+			ipv6_test)
+				/usr/bin/ninictl ipv6_test
+				;;
+			get_logs)
+				read -r input
+				local limit=$(echo "$input" | jsonfilter -e '@.limit' 2>/dev/null || echo 200)
+				echo '{"logs": ['
+				local first=1
+				/usr/bin/ninictl get_logs "$limit" | while IFS= read -r line; do
+					[ "$first" = "1" ] || echo ','
+					first=0
+					printf '"%s"' "$(echo "$line" | sed 's/"/\\"/g')"
+				done
+				echo ']}'
+				;;
+			save_config)
+				read -r input
+				local section=$(echo "$input" | jsonfilter -e '@.section' 2>/dev/null || echo "")
+				local values=$(echo "$input" | jsonfilter -e '@.values' 2>/dev/null || echo "")
+				# Parse and save to UCI
+				if [ -n "$section" ] && [ -n "$values" ]; then
+					# values is a JSON object string
+					# Use lua to parse and set UCI
+					lua -e "
+						local cjson = require 'cjson'
+						local uci = require 'uci'
+						local x = uci.cursor()
+						local values = cjson.decode('$values')
+						for k, v in pairs(values) do
+							x:set('nini', '$section', k, tostring(v))
+						end
+						x:commit('nini')
+					" 2>/dev/null || echo '{"result": false, "error": "save failed"}'
+					echo '{"result": true}'
+				else
+					echo '{"result": false, "error": "missing section or values"}'
+				fi
+				;;
+			get_config)
+				read -r input
+				local section=$(echo "$input" | jsonfilter -e '@.section' 2>/dev/null || echo "")
+				if [ -n "$section" ]; then
+					uci -q show nini.${section} | sed 's/^nini\.[^=]*=//' | while IFS='=' read -r k v; do
+						echo "${k}=${v}"
+					done
+				else
+					echo '{"error": "missing section"}'
+				fi
+				;;
+			*)
+				echo '{"error": "unknown method"}'
+				;;
+		esac
+		;;
+	*)
+		log "Unknown command: $1"
+		exit 1
+		;;
+esac
