@@ -48,7 +48,8 @@ jobs:
     - name: Copy package
       run: |
         rm -rf sdk/package/luci-app-nini
-        cp -r "$GITHUB_WORKSPACE" sdk/package/luci-app-nini
+        mkdir -p sdk/package/luci-app-nini
+        cp -r "$GITHUB_WORKSPACE"/Makefile "$GITHUB_WORKSPACE"/files sdk/package/luci-app-nini/
         ls sdk/package/luci-app-nini/
 
     - name: Configure
