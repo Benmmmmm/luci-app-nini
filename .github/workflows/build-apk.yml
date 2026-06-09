@@ -31,7 +31,8 @@ jobs:
 
     - name: Download ImmortalWrt SDK
       run: |
-        wget -q "$SDK_URL" -O "$SDK_FILENAME"
+        echo "Downloading SDK from: $SDK_URL"
+        curl -L --retry 3 --max-time 300 -o "$SDK_FILENAME" "$SDK_URL"
         echo "SDK downloaded: $(ls -lh $SDK_FILENAME)"
 
     - name: Extract SDK
