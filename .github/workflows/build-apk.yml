@@ -8,114 +8,67 @@ on:
 
 env:
   SDK_URL: https://downloads.immortalwrt.org/releases/25.12.0/targets/mediatek/filogic/immortalwrt-sdk-25.12.0-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64.tar.zst
-  SDK_FILENAME: sdk.tar.zst
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     steps:
     - name: Checkout source
       uses: actions/checkout@v4
 
-    - name: Install build dependencies
+    - name: Install dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y build-essential ccache ecj fastjar file g++ gawk \
           gettext git java-propose-classpath libelf-dev libncurses5-dev \
           libncursesw5-dev libssl-dev python3 python3-distutils python3-setuptools \
-          rsync subversion swig time xsltproc zlib1g-dev zstd libncurses-dev curl wget
+          rsync subversion swig time xsltproc zlib1g-dev zstd wget curl
+      continue-on-error: false
 
-    - name: Download ImmortalWrt SDK
+    - name: Download SDK
       run: |
-        echo "SDK URL: $SDK_URL"
         echo "Downloading SDK..."
-        curl -v -L --retry 3 --max-time 600 -o "$SDK_FILENAME" "$SDK_URL" || {
-          echo "curl failed, trying wget..."
-          wget -O "$SDK_FILENAME" "$SDK_URL" || {
-            echo "Both curl and wget failed to download SDK"
-            exit 1
-          }
-        }
-        echo "Download complete. File size:"
-        ls -lh "$SDK_FILENAME"
-        echo "File type check:"
-        file "$SDK_FILENAME"
+        curl -L --retry 3 --max-time 600 -o sdk.tar.zst "$SDK_URL"
+        ls -lh sdk.tar.zst
+        file sdk.tar.zst
 
     - name: Extract SDK
       run: |
-        echo "Extracting SDK..."
-        tar --zstd -xf "$SDK_FILENAME"
-        echo "Extracted contents:"
-        ls -la
-        mv immortalwrt-sdk-* sdk 2>/dev/null || mv openwrt-sdk-* sdk 2>/dev/null || {
-          echo "Could not find extracted SDK directory"
-          ls -la
-          exit 1
-        }
-        echo "SDK directory:"
-        ls -la sdk/
+        tar --zstd -xf sdk.tar.zst
+        ls -d immortalwrt-sdk-* || ls -d openwrt-sdk-*
+        mv immortalwrt-sdk-* sdk 2>/dev/null || mv openwrt-sdk-* sdk
+        ls sdk/
 
-    - name: Update feeds
+    - name: Setup feeds
       run: |
         cd sdk
-        ./scripts/feeds update -a || echo "Some feeds failed but continuing..."
+        ./scripts/feeds update -a || true
+        ./scripts/feeds install -a || true
 
-    - name: Install feeds
-      run: |
-        cd sdk
-        ./scripts/feeds install -a || echo "Some feeds failed but continuing..."
-
-    - name: Copy NINI package
+    - name: Copy package
       run: |
         cp -r "$GITHUB_WORKSPACE" sdk/package/luci-app-nini
-        ls -la sdk/package/luci-app-nini/
+        ls sdk/package/luci-app-nini/
 
-    - name: Configure build
+    - name: Configure
       run: |
         cd sdk
         echo "CONFIG_PACKAGE_luci-app-nini=m" > .config
-        make defconfig || {
-          echo "defconfig failed"
-          exit 1
-        }
-        grep luci-app-nini .config || {
-          echo "luci-app-nini not in config"
-          exit 1
-        }
+        make defconfig
+        grep luci-app-nini .config
 
-    - name: Compile package
+    - name: Build
       run: |
         cd sdk
-        make package/luci-app-nini/compile V=s -j$(nproc) || {
-          echo "Build failed, retrying with single core..."
-          make package/luci-app-nini/clean V=s
-          make package/luci-app-nini/compile V=s -j1
-        }
+        make package/luci-app-nini/compile V=s -j$(nproc)
 
-    - name: Find and copy APK
+    - name: Collect APK
       run: |
         cd sdk
-        echo "Searching for built APK..."
-        find bin -name "luci-app-nini*.apk" -type f
-        find bin -name "luci-app-nini*.apk" -type f -exec ls -lh {} \;
-        find bin -name "luci-app-nini*.apk" -type f -exec cp {} "$GITHUB_WORKSPACE/" \;
-        echo "APK in workspace:"
-        ls -lh "$GITHUB_WORKSPACE/"*.apk 2>/dev/null || echo "No APK found"
+        find bin -name "luci-app-nini*.apk" -exec ls -lh {} \;
+        find bin -name "luci-app-nini*.apk" -exec cp {} "$GITHUB_WORKSPACE/" \;
 
-    - name: Inspect APK
-      run: |
-        APK_FILE=$(ls -1 "$GITHUB_WORKSPACE"/luci-app-nini*.apk 2>/dev/null | head -1)
-        if [ -n "$APK_FILE" ]; then
-          echo "APK file: $APK_FILE"
-          echo "File size: $(ls -lh "$APK_FILE")"
-          echo "=== Tar contents ==="
-          tar tf "$APK_FILE" | sort
-        else
-          echo "No APK file found to inspect"
-          exit 1
-        fi
-
-    - name: Upload APK artifact
+    - name: Upload
       uses: actions/upload-artifact@v4
       if: always()
       with:
